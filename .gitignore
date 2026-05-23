@@ -1,0 +1,9 @@
+.env
+__pycache__/
+*.pyc
+papers/
+markdown/
+json_output/
+db/
+*.db
+debug/
