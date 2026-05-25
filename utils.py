@@ -11,9 +11,10 @@ import random
 import logging
 
 from pathlib import Path
-from openai import OpenAI, RateLimitError, APIConnectionError, APITimeoutError
 
 logger = logging.getLogger(__name__)
+HASH_HEX_CHARS = 24
+HASH_BITS = HASH_HEX_CHARS * 4
 
 
 # ─── 配置 ──────────────────────────────────────────────────────
@@ -23,11 +24,11 @@ def load_config():
     return {
         "api_key":      os.environ.get("OPENAI_API_KEY", ""),
         "base_url":     os.environ.get("OPENAI_BASE_URL", ""),
-        "model":        os.environ.get("LLM_MODEL", "gpt-4o"),
+        "model":        os.environ.get("LLM_MODEL", ""),
         "temperature":  float(os.environ.get("LLM_TEMPERATURE", "0.0")),
         "max_input_chars":   int(os.environ.get("MAX_INPUT_CHARS", "100000")),
         "max_output_tokens": int(os.environ.get("MAX_OUTPUT_TOKENS", "16384")),
-        "max_retries":       int(os.environ.get("MAX_RETRIES", "5")),
+        "max_retries":       int(os.environ.get("MAX_RETRIES", "3")),
         "min_md_chars":      int(os.environ.get("MIN_MD_CHARS", "10000")),
         "metadata_head_chars": int(os.environ.get("METADATA_HEAD_CHARS", "5000")),
         "workers":           int(os.environ.get("WORKERS", "1")),
@@ -46,11 +47,98 @@ def load_config():
     }
 
 
-# ─── Doc ID ────────────────────────────────────────────────────
+def resolve_pipeline_paths(base_dir: Path, cfg: dict, source: str | Path | None = None) -> tuple[Path, Path]:
+    """返回 PDF 来源目录及其对应的 Markdown 目录。
 
-def generate_doc_id(title: str | None, stem: str = "") -> str:
-    src = (title or "") + "|" + stem
-    return f"doc_{hashlib.md5(src.encode()).hexdigest()[:16]}"
+    当来源是配置 PDF 根目录内的子目录时，Markdown 保留相对层级，
+    使分步调试只处理该范围产生的文件。
+    """
+    pdf_root = (base_dir / cfg["pdf_dir"]).resolve()
+    markdown_root = (base_dir / cfg["markdown_dir"]).resolve()
+    if source is None:
+        return pdf_root, markdown_root
+
+    source_path = Path(source)
+    source_dir = (source_path if source_path.is_absolute() else base_dir / source_path).resolve()
+    try:
+        relative = source_dir.relative_to(pdf_root)
+    except ValueError:
+        relative = Path(source_dir.name)
+    markdown_dir = markdown_root if relative == Path(".") else markdown_root / relative
+    return source_dir, markdown_dir
+
+
+def resolve_identity_source_root(base_dir: Path, cfg: dict, source_dir: Path) -> Path:
+    """Use the configured PDF corpus root whenever a selected source is within it."""
+    pdf_root = (base_dir / cfg["pdf_dir"]).resolve()
+    try:
+        source_dir.resolve().relative_to(pdf_root)
+        return pdf_root
+    except ValueError:
+        return source_dir.resolve()
+
+
+def cli_values(argv: list[str], flag: str) -> list[str]:
+    """读取可重复的 `--flag value` 命令行值。"""
+    values = []
+    for index, arg in enumerate(argv):
+        if arg == flag and index + 1 < len(argv):
+            values.append(argv[index + 1])
+    return values
+
+
+def normalize_source_key(value: str | Path) -> str:
+    """Normalize a CLI/source value to a relative PDF task key."""
+    text = str(value).replace("\\", "/")
+    while text.startswith("./"):
+        text = text[2:]
+    path = Path(text)
+    if not text or path.is_absolute() or ".." in path.parts:
+        raise ValueError(f"无效的 source_key: {value}")
+    if text.lower().endswith(".pdf"):
+        text = f"{text[:-4]}.pdf"
+    else:
+        text = f"{text}.pdf"
+    return Path(text).as_posix()
+
+
+def source_key_for_path(path: Path, source_dir: Path) -> str:
+    """Return a PDF task key from a corresponding PDF/Markdown/JSON path."""
+    relative = path.resolve().relative_to(source_dir.resolve()).with_suffix(".pdf")
+    return normalize_source_key(relative)
+
+
+def artifact_path_for_source_key(root: Path, source_key: str, suffix: str) -> Path:
+    """Map a PDF source key to a same-layout Markdown or JSON artifact path."""
+    key = normalize_source_key(source_key)
+    return root / Path(key).with_suffix(suffix)
+
+
+# ─── Document identity / fingerprints ──────────────────────────
+
+def compact_sha256_bytes(content: bytes) -> str:
+    """Return a 96-bit persisted SHA-256 prefix for corpus identity checks."""
+    return hashlib.sha256(content).hexdigest()[:HASH_HEX_CHARS]
+
+
+def compact_sha256_text(content: str) -> str:
+    return compact_sha256_bytes(content.encode("utf-8"))
+
+
+def compact_sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(chunk_size):
+            digest.update(chunk)
+    return digest.hexdigest()[:HASH_HEX_CHARS]
+
+
+def generate_doc_id(source_pdf_sha256_96: str) -> str:
+    """Create document identity from the exact source PDF bytes."""
+    fingerprint = str(source_pdf_sha256_96 or "").strip()
+    if not re.fullmatch(r"[0-9a-f]{24}", fingerprint):
+        raise ValueError("doc_id 需要 96-bit SHA-256 十六进制指纹")
+    return f"doc_{fingerprint}"
 
 
 # ─── JSON 解析 ─────────────────────────────────────────────────
@@ -123,6 +211,8 @@ def sanitize(obj):
 def call_llm(client, model, sys_prompt, user_prompt, temperature,
              stream=False, max_tokens=16384, max_retries=5, response_json=True):
     """调用 LLM，返回 (parsed_dict, raw_response, token_usage)"""
+    from openai import RateLimitError, APIConnectionError, APITimeoutError
+
     kwargs = dict(model=model, temperature=temperature, max_tokens=max_tokens,
                   messages=[{"role": "system", "content": sys_prompt},
                             {"role": "user", "content": user_prompt}])
@@ -280,24 +370,21 @@ def parse_md_metadata(text: str, md_path: Path) -> dict:
             doi = m.group().rstrip(".,;:)]}")
     meta["doi"] = doi
 
-    # ── 年份（多模式匹配）────────────────────────────────
+    # ── 年份（仅从文首元信息区域生成候选，避免正文示例/引用误命中）──
+    metadata_head = text[:5000]
     year = None
     for pat in [
-        r"(?:Date|Published|Publication\s*date|Submitted|Posted)\s*[:\s]\s*.*?(\d{4})",
-        r"\*?\*?(?:Date|Published)\s*:?\s*\*?\*?\s*.*?(\d{4})",
-        r"(?:Received|Accepted|Revised)\s*[:\s]\s*.*?(\d{4})",
+        r"^\s*(?:[#*_`-]+\s*)?(?:Date|Published|Publication\s*date|Submitted|Posted)\b[^\n]*?(\d{4})",
+        r"^\s*(?:[#*_`-]+\s*)?(?:Received|Accepted|Revised)\b[^\n]*?(\d{4})",
     ]:
-        m = re.search(pat, text, re.IGNORECASE)
+        m = re.search(pat, metadata_head, re.IGNORECASE | re.MULTILINE)
         if m:
             year = int(m.group(1))
             if 1990 <= year <= 2030: break
             year = None
     if not year:
         # 版权符号
-        m = re.search(r"©\s*(\d{4})", text)
-        if m: year = int(m.group(1))
-    if not year:
-        m = re.search(r"\b(20[0-2]\d)\b", text)
+        m = re.search(r"©\s*(\d{4})", metadata_head)
         if m: year = int(m.group(1))
     meta["year"] = year
 

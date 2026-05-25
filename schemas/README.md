@@ -1,249 +1,135 @@
-# 知识抽取系统 Schema
+# 知识抽取输出与状态库约定
 
-与 `extract.py` / `schema.py` / `prompts.py` 实际逻辑完全一致。
+## 流程
 
----
-
-## 一、抽取流程
-
+```text
+PDF
+  -> convert: PDF 指纹去重、带页码 Markdown、转换文本指纹去重
+  -> preprocess: 元数据修正和学科分类
+  -> extract: 两组 anchor 抽取、程序定位并扩展 evidence
 ```
-PDF → convert(MD) → preprocess(元数据+学科, 1次LLM) → extract(多组LLM, 组间串行/并行可配)
-```
 
-| 阶段 | 功能 | 并发 |
-|------|------|------|
-| convert | PDF → Markdown | 多进程，`CONVERT_WORKERS` |
-| preprocess | 正则提取元数据 + LLM修正标题/DOI + 学科分类 | 多线程，`WORKERS` |
-| extract | 按分组多次调 LLM，自由组合 12 种知识类型 | 多线程，`WORKERS`，组间串行/并行可配 |
+`convert` 保留解析到的图题和 Markdown 表格，并在每页前写入 `<!-- PAGE N -->`。`extract` 只让 LLM 输出短的逐字 `anchor_text`，随后由程序匹配回同一 Markdown，补回页码和更长的 `original_text`。正文证据保存 anchor 覆盖的完整句子及前后各最多 5 句，最多 5000 字符；表格证据仅扩展为 caption、表头、命中行和邻近解释，不把整张表的无关数值复制到每条知识中。
 
----
+## 文档身份
 
-## 二、Metadata 结构
+| 字段 | 含义 |
+|---|---|
+| `metadata.doc_id` | `doc_<source_pdf_sha256_96>`，由程序生成，绑定原始 PDF 字节 |
+| `metadata.source_file` | 相对于配置 `PDF_DIR` 的源文件路径，例如 `biology/model.pdf` |
+| `metadata.source_pdf_sha256_96` | 原始 PDF 的 SHA-256 前 24 个十六进制字符（96 bit） |
+| `metadata.converted_text_sha256_96` | 清洗后 Markdown 文本的 SHA-256 前 24 个十六进制字符（96 bit） |
 
-每篇论文的 `metadata` 对象：
+SHA-256 仍完整计算，只持久化 96 bit 前缀用于索引和 ID。对于约 8000 万篇的非对抗语料，96 bit 的随机碰撞风险可忽略；64 bit 不适合作为这个规模的唯一身份字段。
 
-| 字段 | 必填 | 说明 |
-|------|------|------|
-| `doc_id` | 是 | MD5(title\|stem) 前16位 |
-| `source_file` | 是 | 原始 MD 文件名 |
-| `title` | 是 | LLM 修正后的标题 |
-| `year` | 否 | LLM 修正后的出版年 |
-| `doi` | 否 | LLM 修正后的 DOI |
-| `abstract` | 否 | 正则提取的摘要 |
-| `introduction` | 否 | 正则提取的引言 |
-| `primary_discipline` | 是 | `{"level1": "...", "level2": "...", "level3": "..."}` |
-| `secondary_disciplines` | 否 | `[{"level1": "...", "level2": "...", "level3": "..."}, ...]` |
-| `keywords` | 是 | 关键词列表 |
-| `extraction_info` | 是 | 见下 |
+`doc_id` 不由标题、文件名、DOI 或 LLM 生成。标题修正和文件重命名不会改变同一 PDF 的 `doc_id`。`doi` 已保存在元数据中，不另建重复的 `paper_id` 字段。
 
-### extraction_info
+## Entry 外壳
 
-| 字段 | 说明 |
-|------|------|
-| `extraction_model` | LLM 模型名称 |
-| `extraction_timestamp` | ISO 8601 时间戳 |
-| `extraction_method` | `"grouped"` |
-| `retry_groups` | 增量重试的组名（首轮为 null） |
-| `failed_groups` | 本轮失败的组名（全成功为 null） |
-
----
-
-## 三、公共字段
-
-每条知识条目（entry）都包含以下公共字段：
-
-| 字段 | 必填 | 说明 |
-|------|------|------|
-| `type` | 是 | 知识类型，取值见下方 12 种 |
-| `<type>_id` | 是 | 类型 ID，格式 `doc_xxx_?N`（见各类型定义） |
-| `evidence` | 是 | `{"section": "...", "original_text": "原文摘录 8-10 句"}` |
-| `confidence` | 是 | 置信度 0.0~1.0 |
-
-### Evidence 规范
+所有知识类型使用相同结构：
 
 ```json
 {
-  "section": "Abstract",
-  "original_text": "原文直接摘录，8-10个完整句子，禁止改写..."
+  "entry_id": "doc_51050ced82df75c143b15126_method_0001",
+  "type": "method",
+  "payload": {
+    "name": "Example Method",
+    "method_type": "model"
+  },
+  "evidence": {
+    "section": "Methods",
+    "page": 3,
+    "anchor_text": "逐字复制的短原文锚点。",
+    "original_text": "程序定位后扩展的、供下游二次处理的原文上下文。",
+    "match_method": "exact"
+  },
+  "confidence": 0.95
 }
 ```
 
-1. **忠实性** — `original_text` 必须是原文直接摘录，禁止改写
-2. **完整性** — 至少 8-10 句完整段落，保留实验条件、数值、对比基准等全部细节
-3. **关联性** — relation 的 evidence 必须明确体现 head→tail 语义关系
-4. **防幻觉** — 论文缺乏实质学术内容时返回空 entries
+`entry_id` 由程序在最终去重后按 `doc_id + type + 序号` 生成，例如 `doc_..._concept_0001`。LLM 不输出任何 ID、页码或匹配状态。内部会用不写入 JSON 的比较键合并同一类型、同一 payload 和同一 anchor 的重复条目。
 
----
+`entry_id` 的作用是当前抽取结果内的引用标识，尤其用于 relation 链接 concept；它不承诺在重新抽取后稳定不变。当条目增删或排序变化时，同类型后续序号可能改变。跨结果溯源应依赖稳定的 `doc_id` 与 `evidence`。
 
-## 四、知识类型定义（12 种，自由组合抽取）
+### Evidence
 
-### 1. concept — 关键概念、术语、实体
+| 字段 | 生成方 | 说明 |
+|---|---|---|
+| `section` | LLM | 锚点所在章节名，可为空 |
+| `anchor_text` | LLM | 输入中逐字复制的短连续锚点，保留在最终 JSON 中供审计 |
+| `page` | 程序 | 命中页码；无法匹配为 `null` |
+| `original_text` | 程序 | 从源 Markdown 扩展的较长上下文 |
+| `match_method` | 程序 | `exact`、`unique_fragment` 或 `unmatched` |
 
-| 字段 | 必填 | 说明 |
-|------|------|------|
-| `concept_id` | 是 | `doc_xxx_cN` |
-| `term` | 是 | 原文术语 |
-| `normalized` | 是 | 规范化中文名 |
-| `std_label` | 否 | 标准缩写 |
+`exact` 是经过排版归一化后的完整锚点字面匹配。`unique_fragment` 只在至少 80 字符的连续片段在全文唯一出现时使用。程序不使用语义 fuzzy match 强行绑定改写过的证据。
 
----
+正文 `original_text` 的扩展规则是：定位 anchor 所覆盖的句子，追加其前 5 句和后 5 句；遇到文首、文末或 5000 字符上限时提前停止。句子切分会保护小数和常见论文缩写（如 `e.g.`、`Fig.`、`et al.`）。表格仍按 caption、表头、命中行和紧邻解释文本处理，不套用句子窗口。
 
-### 2. relation — 概念间语义关系
+## Payload 字段
 
-`head` / `tail` 通过多级匹配（精确→去括号→子串→去括号子串）关联为 concept_id。匹配不上则置空字符串，但 `head_term` / `tail_term` 始终保留原文 term。
+| `type` | `payload` 字段 |
+|---|---|
+| `concept` | `term`, `normalized`, `std_label` |
+| `relation` | `head_entry_id`, `tail_entry_id`, `head_term`, `tail_term`, `relation_type`, `relation_surface` |
+| `dataset` | `name`, `modality`, `domain` |
+| `data_specification` | `spec_type`, `description` |
+| `method` | `name`, `method_type` |
+| `experiment` | `task`, `setup` |
+| `quantitative_result` | `quantity`, `value`, `unit`, `context`, `result_type` |
+| `performance_result` | `metric`, `compared_to` |
+| `claim` | 空对象 `{}`，语义由 evidence 表达 |
+| `conclusion` | 空对象 `{}`，语义由 evidence 表达 |
+| `limitation` | 空对象 `{}`，语义由 evidence 表达 |
+| `future_work` | 空对象 `{}`，语义由 evidence 表达 |
 
-| 字段 | 必填 | 说明 |
-|------|------|------|
-| `relation_id` | 是 | `doc_xxx_rN` |
-| `head` | 是 | 起始概念 concept_id（匹配不上为 `""`） |
-| `head_term` | 是 | 起始概念原文 term |
-| `relation_type` | 是 | `enhances` / `inhibits` / `causes` / `creates` / `influences` / `belongs_to` / `measures` / `uses` / `compares` / `precedes` / `derives` |
-| `relation_surface` | 是 | 原文中表达关系的短语 |
-| `tail` | 是 | 目标概念 concept_id（匹配不上为 `""`） |
-| `tail_term` | 是 | 目标概念原文 term |
+`relation.head_entry_id` 和 `tail_entry_id` 由程序用规范化 term/缩写精确链接到本 JSON 中的 `concept.entry_id`。无法精确链接时字段为 `null`，但保留原文 term 和 evidence，供下游继续处理。
 
----
+## 状态库
 
-### 3. dataset — 论文使用/产生的数据集
+`db/<source>.db` 的 `papers` 表保存阶段状态、指纹、消耗统计和跳过审计信息。与去重及溯源直接相关的字段如下：
 
-| 字段 | 必填 | 说明 |
-|------|------|------|
-| `dataset_id` | 是 | `doc_xxx_dN` |
-| `name` | 是 | 数据集名称 |
-| `modality` | 否 | `text` / `image` / `tabular` / `time_series` / `multimodal` / `other` |
-| `domain` | 否 | 所属领域 |
+| 字段 | 说明 |
+|---|---|
+| `source_key` | 任务主键，为相对于配置 `PDF_DIR` 的 PDF 路径，例如 `biology/model.pdf` |
+| `doc_id` | PDF 指纹生成的文档 ID |
+| `source_pdf_sha256_96` | convert 前计算的原 PDF 指纹 |
+| `converted_text_sha256_96` | convert 后清洗 Markdown 指纹 |
+| `duplicate_of` | 被判定重复时所对应的保留任务 `source_key` |
+| `skip_code` | 结构化跳过原因 |
+| `skip_detail` | 可读的具体解释 |
+| `skip_reason` | 兼容旧查询的组合文本，格式为 `<skip_code>: <skip_detail>` |
 
----
+### 跳过原因
 
-### 4. data_specification — 数据格式规范、质量标准
+| `skip_code` | 发生阶段 | 含义 | 是否已耗费转换时间 |
+|---|---|---|---|
+| `duplicate_pdf` | convert 前 | 原始 PDF 指纹已存在；该文件不再解析 | 否 |
+| `duplicate_markdown` | convert 后 | PDF 不同，但清洗后 Markdown 文本与已保留文档相同；不进入 LLM 阶段 | 是 |
+| `insufficient_text` | convert 后 | 解析出的文本少于 `MIN_MD_CHARS`，通常表示扫描件或解析质量不足 | 是 |
 
-| 字段 | 必填 | 说明 |
-|------|------|------|
-| `ds_id` | 是 | `doc_xxx_dsN` |
-| `spec_type` | 是 | `format_rule` / `quality_standard` / `env_requirement` / `metadata_standard` |
-| `description` | 否 | 一句话摘要 |
+状态库为两个指纹字段和 `skip_code` 建立索引，避免去重检查随着语料增长退化为整表扫描。
+状态约定：`duplicate_pdf` 记录为 `convert/preprocess/extract=skipped`；`duplicate_markdown` 和 `insufficient_text` 因为 Markdown 已经生成，记录为 `convert=done, preprocess/extract=skipped`。
+单独执行下游阶段的 `--force` 不会清除 convert 判定的跳过记录；需要重新判定被排除文件时，应从 `convert --force` 开始。
+升级自旧状态库时，`convert` 会仅为缺少新指纹的历史 `done` 记录补算一次 PDF 指纹和已有 Markdown 指纹，使之后新增的重复文件仍能在正确阶段被拦截。
+被判为 `duplicate_pdf` 或 `duplicate_markdown` 的任务会移除其已生成的重复 Markdown 以及旧 JSON/debug 产物；`insufficient_text` 保留 Markdown 供解析质量诊断，但移除旧抽取 JSON/debug，避免下游误用已跳过结果。
 
----
+状态库打开旧版本 `stem` 主键表时会自动迁移为 `source_key`：旧的平铺任务 `ace` 会成为 `ace.pdf`。新的嵌套输入会分别记录为 `biology/model.pdf` 和 `chemistry/model.pdf`，不会因文件名相同而共享状态或产物。`--source` 仅限制本次处理范围，不改变同一文件的 `source_key` 或状态库。
 
-### 5. method — 方法、模型、算法、仪器
+## 运行与迁移
 
-| 字段 | 必填 | 说明 |
-|------|------|------|
-| `method_id` | 是 | `doc_xxx_mN` |
-| `name` | 是 | 方法/模型/仪器名称 |
-| `method_type` | 是 | `model` / `algorithm` / `protocol` / `software` / `instrument` / `preprocessing` / `field_research` / `textual_analysis` / `survey` / `interview` |
-
----
-
-### 6. experiment — 实验设置与流程
-
-| 字段 | 必填 | 说明 |
-|------|------|------|
-| `experiment_id` | 是 | `doc_xxx_xN` |
-| `task` | 是 | 实验任务名称 |
-| `setup` | 否 | 实验条件摘要 |
-
----
-
-### 7. quantitative_result — 科学度量与实验指标
-
-排除年份、页数、编号等元信息。
-
-| 字段 | 必填 | 说明 |
-|------|------|------|
-| `qr_id` | 是 | `doc_xxx_qrN` |
-| `quantity` | 是 | 物理量/指标名称 |
-| `value` | 否 | 数值 |
-| `unit` | 否 | 单位 |
-| `context` | 是 | 实验条件/上下文 |
-| `result_type` | 是 | `main_result` / `baseline` / `ablation` / `measurement` / `threshold` |
-
----
-
-### 8. performance_result — 性能对比/评价
-
-| 字段 | 必填 | 说明 |
-|------|------|------|
-| `perf_id` | 是 | `doc_xxx_pN` |
-| `metric` | 否 | 被比较的指标名称 |
-| `compared_to` | 否 | 对比对象 |
-
----
-
-### 9. claim — 核心主张/发现
-
-仅需 `evidence`，无额外标注字段。
-
-| 字段 | 必填 | 说明 |
-|------|------|------|
-| `claim_id` | 是 | `doc_xxx_caN` |
-
----
-
-### 10. conclusion — 经实验验证的结论
-
-仅需 `evidence`，无额外标注字段。
-
-| 字段 | 必填 | 说明 |
-|------|------|------|
-| `conclusion_id` | 是 | `doc_xxx_clN` |
-
----
-
-### 11. limitation — 方法局限、适用约束
-
-仅需 `evidence`，无额外标注字段。
-
-| 字段 | 必填 | 说明 |
-|------|------|------|
-| `limitation_id` | 是 | `doc_xxx_lmN` |
-
----
-
-### 12. future_work — 未来研究方向
-
-仅需 `evidence`，无额外标注字段。
-
-| 字段 | 必填 | 说明 |
-|------|------|------|
-| `future_work_id` | 是 | `doc_xxx_fwN` |
-
----
-
-## 五、分组配置（灵活组合）
-
-`.env` 中 `EXTRACT_GROUPS` 和 `EXTRACT_GROUP_SPEC` 控制抽取哪些知识类型、如何分组：
-
-### 方式一：预设分组（`EXTRACT_GROUPS`）
-
-从以下快捷名中逗号分隔选取：
-
-| 快捷名 | 对应类型 | 说明 |
-|------|------|------|
-| `concept` | concept | 概念独立抽取 |
-| `relation` | relation | 关系独立抽取（不依赖概念列表） |
-| `concept_relation` | concept + relation | 概念和关系合并抽取 |
-| `dataset_spec` | dataset + data_specification | 数据资源 |
-| `method_experiment` | method + experiment | 方法实验 |
-| `quant_perf` | quantitative_result + performance_result | 量化结果 |
-| `insight_outlook` | claim + conclusion + limitation + future_work | 结论展望 |
-**示例**：
-```bash
-EXTRACT_GROUPS=concept,relation,dataset_spec,method_experiment,quant_perf,insight_outlook  # 推荐：7 组独立
-EXTRACT_GROUPS=concept_relation,dataset_spec,method_experiment,quant_perf,insight_outlook   # 5 组
-EXTRACT_GROUPS=concept_relation,method_experiment                                            # 只抽部分类型
-# 留空 → 默认 5 组（G1~G5）
-```
-
-### 方式二：完全自定义（`EXTRACT_GROUP_SPEC`）
-
-设置后覆盖 `EXTRACT_GROUPS`。`|` 分隔组，`+` 连接同组类型：
+完整流程：
 
 ```bash
-# 例：concept 独立、relation 独立、其余全合并
-EXTRACT_GROUP_SPEC=concept|relation|dataset+method+experiment+quantitative_result+performance_result+conclusion+claim+future_work+limitation
+conda run --no-capture-output -n myagent python run.py all --force --debug
 ```
 
-### 组间并行
+查看产物和 anchor 定位统计：
 
-`EXTRACT_GROUP_PARALLEL`：`1`=串行，`0`=所有组并行，`N`=最多 N 组并发。
+```bash
+conda run --no-capture-output -n myagent python run.py inspect
+conda run --no-capture-output -n myagent python run.py status
+```
+
+旧 JSON 使用平铺类型字段和旧 ID，不能与新格式增量混合。正式 JSON 要求 `doc_id` 来自原始 PDF 指纹，不能绕过 convert 从旧 Markdown 生成；首次切换到本契约时应从 `convert` 开始完整重跑。
+
+处理单篇或嵌套路径下的单篇时，`--paper` 接受相对于 `PDF_DIR` 的路径，可省略 `.pdf`，例如 `--paper biology/model`。

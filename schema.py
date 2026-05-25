@@ -2,113 +2,93 @@
 schema.py — 知识抽取 Pydantic 模型定义
 """
 
-from typing import Optional, List, Literal  # noqa: F401
+from typing import Optional, List, Literal
 from pydantic import BaseModel, Field
 
 
 class Evidence(BaseModel):
     section: str = ""
+    page: Optional[int] = None
+    anchor_text: str = ""
     original_text: str = ""
+    match_method: Literal["exact", "unique_fragment", "unmatched"] = "unmatched"
 
 
-class Concept(BaseModel):
-    concept_id: str
+class ConceptPayload(BaseModel):
     term: str
     normalized: str = ""
     std_label: str = ""
-    evidence: Evidence = Evidence(section="", original_text="")
-    confidence: float = 1.0
 
 
-class Relation(BaseModel):
-    relation_id: str
-    head: str = ""
-    tail: str = ""
+class RelationPayload(BaseModel):
+    head_entry_id: Optional[str] = None
+    tail_entry_id: Optional[str] = None
     head_term: str = ""
     tail_term: str = ""
     relation_type: str = ""
     relation_surface: str = ""
-    evidence: Evidence = Evidence(section="", original_text="")
-    confidence: float = 1.0
 
 
-class Dataset(BaseModel):
-    dataset_id: str
+class DatasetPayload(BaseModel):
     name: str
     modality: str = ""
     domain: str = ""
-    evidence: Evidence = Evidence(section="", original_text="")
-    confidence: float = 1.0
 
 
-class Method(BaseModel):
-    method_id: str
+class MethodPayload(BaseModel):
     name: str
     method_type: str = ""
-    evidence: Evidence = Evidence(section="", original_text="")
-    confidence: float = 1.0
 
 
-class Experiment(BaseModel):
-    experiment_id: str
+class ExperimentPayload(BaseModel):
     task: str = ""
     setup: str = ""
-    evidence: Evidence = Evidence(section="", original_text="")
-    confidence: float = 1.0
 
 
-class QuantitativeResult(BaseModel):
-    qr_id: str
+class QuantitativeResultPayload(BaseModel):
     quantity: str = ""
-    value: Optional[float] = None
+    value: Optional[float | str] = None
     unit: str = ""
     context: str = ""
     result_type: str = ""
-    evidence: Evidence = Evidence(section="", original_text="")
-    confidence: float = 1.0
 
 
-class PerformanceResult(BaseModel):
-    perf_id: str
+class PerformanceResultPayload(BaseModel):
     metric: str = ""
     compared_to: str = ""
-    evidence: Evidence = Evidence(section="", original_text="")
-    confidence: float = 1.0
 
 
-class DataSpecification(BaseModel):
-    ds_id: str
+class DataSpecificationPayload(BaseModel):
     spec_type: str = ""
     description: str = ""
-    evidence: Evidence = Evidence(section="", original_text="")
+
+
+class EmptyPayload(BaseModel):
+    pass
+
+
+PAYLOAD_MODELS = {
+    "concept": ConceptPayload,
+    "relation": RelationPayload,
+    "dataset": DatasetPayload,
+    "method": MethodPayload,
+    "experiment": ExperimentPayload,
+    "performance_result": PerformanceResultPayload,
+    "quantitative_result": QuantitativeResultPayload,
+    "data_specification": DataSpecificationPayload,
+    "conclusion": EmptyPayload,
+    "claim": EmptyPayload,
+    "future_work": EmptyPayload,
+    "limitation": EmptyPayload,
+}
+
+
+class Entry(BaseModel):
+    entry_id: str
+    type: str
+    payload: dict = Field(default_factory=dict)
+    evidence: Evidence = Field(default_factory=Evidence)
     confidence: float = 1.0
-
-
-class Conclusion(BaseModel):
-    conclusion_id: str
-    evidence: Evidence = Evidence(section="", original_text="")
-    confidence: float = 1.0
-
-
-class Claim(BaseModel):
-    claim_id: str
-    evidence: Evidence = Evidence(section="", original_text="")
-    confidence: float = 1.0
-
-
-class FutureWork(BaseModel):
-    future_work_id: str
-    evidence: Evidence = Evidence(section="", original_text="")
-    confidence: float = 1.0
-
-
-class Limitation(BaseModel):
-    limitation_id: str
-    evidence: Evidence = Evidence(section="", original_text="")
-    confidence: float = 1.0
-
-
-Entry = Concept | Relation | Dataset | Method | Experiment | PerformanceResult | QuantitativeResult | DataSpecification | Conclusion | Claim | FutureWork | Limitation
 
 
 class DisciplineLevel(BaseModel):
@@ -127,6 +107,8 @@ class ExtractionInfo(BaseModel):
 
 class Metadata(BaseModel):
     doc_id: str
+    source_pdf_sha256_96: str = ""
+    converted_text_sha256_96: str = ""
     source_file: str = ""
     title: Optional[str] = None
     year: Optional[int] = None
@@ -141,11 +123,11 @@ class Metadata(BaseModel):
 
 class ExtractionOutput(BaseModel):
     metadata: Metadata
-    entries: list = []
+    entries: list[Entry] = Field(default_factory=list)
 
 
 class LLMExtractionResponse(BaseModel):
-    entries: list = []
+    entries: list = Field(default_factory=list)
 
 
 class LLMDisciplineResponse(BaseModel):
