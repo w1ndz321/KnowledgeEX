@@ -48,13 +48,16 @@ MIN_MD_CHARS=10000
 
 ### 3. 运行流程
 
-在项目根目录执行：
+先激活环境并进入项目根目录：
 
 ```bash
-conda run --no-capture-output -n myagent python run.py prepare
-conda run --no-capture-output -n myagent python run.py convert
-conda run --no-capture-output -n myagent python run.py all --from-stage preprocess
-conda run --no-capture-output -n myagent python run.py inspect
+conda activate myagent
+cd /Users/jupiter/Desktop/KnowledgeEX
+
+python run.py prepare
+python run.py convert
+python run.py all --from-stage preprocess
+python run.py inspect
 ```
 
 | 命令 | 结果 |
@@ -88,7 +91,7 @@ KnowledgeEX/
 
 ```bash
 cd /Users/jupiter/Desktop/KnowledgeEX
-conda run --no-capture-output -n myagent python run.py prepare
+python run.py prepare
 ```
 
 得到：
@@ -106,7 +109,7 @@ papers/
 ### 3. 转换 PDF
 
 ```bash
-conda run --no-capture-output -n myagent python run.py convert
+python run.py convert
 ```
 
 得到：
@@ -126,7 +129,7 @@ db/
 ### 4. 抽取知识
 
 ```bash
-conda run --no-capture-output -n myagent python run.py all --from-stage preprocess
+python run.py all --from-stage preprocess
 ```
 
 得到：
@@ -144,7 +147,7 @@ json_output/
 ### 5. 查看结果
 
 ```bash
-conda run --no-capture-output -n myagent python run.py inspect
+python run.py inspect
 ```
 
 该命令会显示每篇论文的知识条目数量、类型统计和已定位到页码的 evidence 数量。
