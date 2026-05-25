@@ -1,153 +1,137 @@
 # KnowledgeEX
 
-KnowledgeEX 将论文 PDF 转换为带原文证据的结构化知识 JSON，供下游 AI4S 任务检索、核验和二次处理。最终 JSON 的字段和知识类型定义见 [schemas/README.md](schemas/README.md)。
+将论文 PDF 转换为带原文证据的结构化知识 JSON。字段定义见 [schemas/README.md](schemas/README.md)。
 
-## Pipeline
+## 流程
 
-| 阶段 | 做什么 | 主要输出 | 是否调用 LLM |
-|---|---|---|---|
-| `prepare` | 将 ZIP 中的 PDF 解压到按批次组织的输入目录 | `papers/<批次>/**/*.pdf` | 否 |
-| `convert` | PDF 去重、解析 Markdown、保留页码/表格/图题、过滤低质量文本 | `markdown/<批次>/**/*.md`、`db/papers.db` | 否 |
-| `preprocess` | 修正标题、DOI、年份；生成学科和关键词 | JSON 中的 `metadata` | 是，每篇 1 次 |
-| `extract` | 提取重要知识并将 evidence anchor 定位回原文 | `json_output/<批次>/**/*.json` | 通常每篇 2 次 |
+| 阶段 | 命令 | 输入 → 输出 | LLM |
+|------|------|------------|:---:|
+| prepare | `run.py prepare` | `archives/*.zip` → `papers/<批次>/*.pdf` | - |
+| convert | `run.py convert` | PDF → `markdown/<批次>/*.md` | - |
+| preprocess | `run.py preprocess` | MD → 元数据（标题/DOI/学科/关键词） | 1次 |
+| extract | `run.py extract` | 全文 → 知识条目 + 原文证据 | 可配 |
 
-一篇有效论文通常需要 3 次 LLM 调用：`preprocess` 1 次，`extract` 2 次。
+## 快速开始
 
-## Quickstart
-
-### 1. 安装依赖
-
-使用 Python 环境安装所需包：
+### 1. 安装
 
 ```bash
-conda activate myagent
 pip install pymupdf4llm pymupdf openai python-dotenv pydantic
 ```
 
-### 2. 配置模型和目录
+### 2. 配置
 
 在项目根目录创建 `.env`：
 
 ```bash
+# 必要
+OPENAI_API_KEY="sk-xxx"
+OPENAI_BASE_URL="https://api.example.com/v1"
+LLM_MODEL="gpt-4o"
+
+# 路径（相对于项目根目录）
 PDF_DIR=papers
 MARKDOWN_DIR=markdown
 JSON_OUTPUT_DIR=json_output
 DB_DIR=db
 
-OPENAI_API_KEY="your-api-key"
-OPENAI_BASE_URL="your-compatible-api-url"
-LLM_MODEL="your-model"
-
-CONVERT_BACKEND=pymupdf4llm
-CONVERT_WORKERS=8
-WORKERS=5
-METADATA_HEAD_CHARS=5000
-MAX_INPUT_CHARS=50000
-MIN_MD_CHARS=10000
+# 可选
+WORKERS=5                 # API 并发数
+CONVERT_WORKERS=8         # PDF 转 Markdown 进程数
+MAX_INPUT_CHARS=50000     # 送 LLM 的最大字符数
+METADATA_HEAD_CHARS=5000  # 无摘要时取论文前 N 字符做学科分类
+MIN_MD_CHARS=10000        # 低于此值的 MD 跳过
+MAX_OUTPUT_TOKENS=16384
+MAX_RETRIES=3
 ```
 
-### 3. 运行流程
-
-先激活环境并进入项目根目录：
+### 3. 运行
 
 ```bash
-conda activate myagent
-cd /Users/jupiter/Desktop/KnowledgeEX
+# 完整流程
+python run.py all
 
-python run.py prepare
-python run.py convert
+# 或分步执行
+python run.py prepare            # ZIP 解压
+python run.py convert            # PDF → Markdown
+python run.py preprocess         # 元数据提取
+python run.py extract            # 知识抽取
+
+# 从中间阶段继续
 python run.py all --from-stage preprocess
+
+# 查看结果
 python run.py inspect
 ```
 
-| 命令 | 结果 |
-|---|---|
-| `run.py prepare` | 将 `archives/` 里的 ZIP 解压为 `papers/` 中的 PDF 批次 |
-| `run.py convert` | 生成 Markdown，并在数据库中记录重复或解析失败的 PDF |
-| `run.py all --from-stage preprocess` | 对可用论文执行 metadata 处理和知识抽取，生成最终 JSON |
-| `run.py inspect` | 查看条目数量、已有页码定位的 evidence 数量和输出位置 |
+## 使用 ZIP 包
 
-## 两个 ZIP 示例
-
-假设你有两个压缩包：
-
-```text
-batch_0001.zip
-batch_0002.zip
-```
-
-### 1. 放到 `archives/`
-
-```text
-KnowledgeEX/
-  archives/
-    batch_0001.zip
-    batch_0002.zip
-```
-
-`archives/` 已被 Git 忽略，不会把原始数据包推送到仓库。
-
-### 2. 解压 PDF
+将 ZIP 放入 `archives/`，然后：
 
 ```bash
-cd /Users/jupiter/Desktop/KnowledgeEX
-python run.py prepare
+python run.py prepare                    # 全部解压
+python run.py prepare --archive batch_001.zip  # 只解压指定包
 ```
 
-得到：
+解压得到 `papers/batch_001/*.pdf`。
 
-```text
-papers/
-  batch_0001/
-    ...pdf
-  batch_0002/
-    ...pdf
-```
+已有 PDF 可以直接放到 `papers/`，跳过 `prepare`。
 
-`prepare` 只提取 PDF。相同 ZIP 重复执行会自动跳过；不要用新版 ZIP 覆盖已经抽取过的批次，新版请改名为新批次，例如 `batch_0001_v2.zip`。
-
-### 3. 转换 PDF
+## 处理指定论文
 
 ```bash
-python run.py convert
+python run.py all --paper path/to/paper    # 只处理单篇
+python run.py all --source papers/batch_001  # 只处理某批次
+python run.py preprocess --reset-failed       # 重试失败的 preprocess
+python run.py extract --debug                 # 保存 LLM 原始响应
 ```
 
-得到：
+## 输出结构
 
-```text
-markdown/
-  batch_0001/
-    ...md
-  batch_0002/
-    ...md
-db/
-  papers.db
 ```
-
-数据库会记录被跳过的文件原因：`duplicate_pdf`、`duplicate_markdown` 或 `insufficient_text`。
-
-### 4. 抽取知识
-
-```bash
-python run.py all --from-stage preprocess
-```
-
-得到：
-
-```text
 json_output/
-  batch_0001/
-    ...json
-  batch_0002/
-    ...json
+  batch_001/
+    paper_doi.json          # metadata + entries + evidence
+    debug/                  # --debug 时保存 LLM 原始响应
+db/
+  papers.db                 # 流水线状态（断点续跑）
 ```
 
-每个 JSON 包含论文元数据、知识条目和可定位回原文的 evidence。
+每个 JSON 结构：
 
-### 5. 查看结果
+```json
+{
+  "metadata": {
+    "doc_id": "doc_xxx",
+    "title": "...",
+    "year": 2024,
+    "doi": "10.xxx/xxx",
+    "primary_discipline": {"level1": "...", "level2": "...", "level3": "..."},
+    "keywords": ["..."]
+  },
+  "entries": [
+    {
+      "type": "concept",
+      "concept_id": "doc_xxx_c1",
+      "term": "...",
+      "evidence": {"section": "Abstract", "original_text": "原文摘录 8-10 句"}
+    }
+  ]
+}
+```
+
+## 抽取分组配置
+
+`.env` 中 `EXTRACT_GROUPS` 控制抽取哪些知识类型：
 
 ```bash
-python run.py inspect
+# 推荐：concept 和 relation 独立，其余全合并
+EXTRACT_GROUPS=concept,relation,dataset_spec,method_experiment,quant_perf,insight_outlook
+
+# 完全自定义：每种类型一个独立 prompt
+EXTRACT_GROUP_SPEC=concept|relation|dataset|method|experiment
 ```
 
-该命令会显示每篇论文的知识条目数量、类型统计和已定位到页码的 evidence 数量。
+## Schema
+
+12 种知识类型的字段定义、分组配置详见 [schemas/README.md](schemas/README.md)。
