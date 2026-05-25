@@ -14,7 +14,6 @@ import os
 import re
 import sys
 import time
-import zipfile
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
@@ -165,36 +164,6 @@ def main() -> int:
     md_root = markdown_root if source_key_root == (BASE_DIR / cfg["pdf_dir"]).resolve() else md_dir
     md_dir.mkdir(parents=True, exist_ok=True)
     only = {normalize_source_key(value) for value in cli_values(sys.argv, "--only")}
-
-    # ZIP 自动解压
-    unzip_first = cfg.get("unzip_first", True)
-    delete_zip = cfg.get("delete_zip_after", False)
-    if unzip_first:
-        zips = sorted(input_dir.glob("**/*.zip"))
-        if zips:
-            print(f"发现 {len(zips)} 个 ZIP，解压中...")
-            for zp in zips:
-                zip_name = zp.stem
-                extract_to = input_dir / zip_name
-                if extract_to.exists():
-                    existing_pdfs = list(extract_to.glob("**/*.pdf"))
-                    if existing_pdfs:
-                        print(f"  跳过 {zp.name}（已解压 {len(existing_pdfs)} pdf）")
-                        if delete_zip: zp.unlink()
-                        continue
-                extract_to.mkdir(parents=True, exist_ok=True)
-                try:
-                    with zipfile.ZipFile(zp, 'r') as zf:
-                        for member in zf.infolist():
-                            if member.filename.lower().endswith('.pdf'):
-                                zf.extract(member, extract_to)
-                except (zipfile.BadZipFile, OSError) as e:
-                    print(f"  ✗ {zp.name} 损坏，跳过: {e}")
-                    continue
-                pdf_count = len(list(extract_to.glob("*.pdf")))
-                print(f"  {zp.name} → {pdf_count} pdf")
-                if delete_zip: zp.unlink()
-            if delete_zip: print("  已删除原始 ZIP")
 
     pdfs = sorted(input_dir.glob("**/*.pdf"))
     if only:

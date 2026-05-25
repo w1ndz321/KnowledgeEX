@@ -42,8 +42,6 @@ def load_config():
         "markdown_dir":       os.environ.get("MARKDOWN_DIR", "markdown"),
         "json_output_dir":    os.environ.get("JSON_OUTPUT_DIR", "json_output"),
         "db_dir":             os.environ.get("DB_DIR", "db"),
-        "unzip_first":        os.environ.get("UNZIP_FIRST", "true").lower() == "true",
-        "delete_zip_after":   os.environ.get("DELETE_ZIP_AFTER_UNZIP", "false").lower() == "true",
     }
 
 

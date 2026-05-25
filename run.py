@@ -3,6 +3,7 @@ run.py - KnowledgeEX 主程序。
 
 推荐用法:
     python run.py all                              # convert -> preprocess -> extract
+    python run.py prepare                          # archives/*.zip -> papers/<batch>/
     python run.py all --paper biology/ace --debug  # 按相对于 PDF_DIR 的路径调试单篇
     python run.py all --to-stage convert           # 仅跑到 Markdown，随后 inspect
     python run.py all --from-stage preprocess      # 从已有 Markdown 继续
@@ -191,6 +192,17 @@ def cmd_all(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_prepare(args: argparse.Namespace) -> int:
+    from prepare_archives import prepare_archives
+
+    cfg = load_config()
+    archive_root = Path(args.archives_dir)
+    if not archive_root.is_absolute():
+        archive_root = BASE_DIR / archive_root
+    output_root = (BASE_DIR / cfg["pdf_dir"]).resolve()
+    return prepare_archives(archive_root, output_root, args.archive, args.force)
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     db = _get_db(args.source)
     if not args.paper:
@@ -328,6 +340,15 @@ def cmd_inspect(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="KnowledgeEX 分步流水线主程序")
     commands = parser.add_subparsers(dest="command", required=True)
+
+    prepare_parser = commands.add_parser("prepare", help="将 archives/ 中的 ZIP 准备为 papers/ 批次")
+    prepare_parser.add_argument("--archives-dir", default="archives", help="ZIP 来源目录，默认 archives")
+    prepare_parser.add_argument(
+        "--archive", action="append", default=[], metavar="RELATIVE_ZIP",
+        help="只准备指定 ZIP 的相对路径，可省略 .zip，可重复使用",
+    )
+    prepare_parser.add_argument("--force", action="store_true", help="删除并重建已有目标批次")
+    prepare_parser.set_defaults(handler=cmd_prepare)
 
     all_parser = commands.add_parser("all", help="按顺序运行完整或部分流水线")
     _add_scope_args(all_parser)
